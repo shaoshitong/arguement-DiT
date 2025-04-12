@@ -1,0 +1,1 @@
+python -m torch.distributed.run --nproc-per-node=8 train_caption_wocutmix.py --select_type min --select_num 50000

@@ -68,11 +68,14 @@ class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob):
+    def __init__(self, text_embedding, hidden_size, dropout_prob):
         super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
+        self.mlp = nn.Sequential(
+            nn.Linear(text_embedding, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.text_embedding = text_embedding
         self.dropout_prob = dropout_prob
 
     def token_drop(self, labels, force_drop_ids=None):
@@ -83,15 +86,21 @@ class LabelEmbedder(nn.Module):
             drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
         else:
             drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
+        drop_ids = drop_ids.unsqueeze(1).unsqueeze(1).expand_as(labels)
+
+        labels = torch.where(drop_ids, torch.zeros(self.text_embedding,device=labels.device), labels)
         return labels
 
     def forward(self, labels, train, force_drop_ids=None):
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
             labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
+        # embeddings = self.embedding_table(labels)
+  
+        embeddings = self.mlp(labels)  # shape: (batch_size, hidden_size)
+        
         return embeddings
+
 
 
 #################################################################################
@@ -114,11 +123,26 @@ class DiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
+        self.single_token_modulation = nn.ModuleList([nn.Linear(32, 1, bias=True) for _ in range(6)])
 
+    def quick_token_merge(self, x, func):
+        x = x.permute(0,2,1)
+        x = func(x)
+        x = x.permute(0,2,1).squeeze(1)
+        return x
+        
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=2)
+        shift_msa = self.quick_token_merge(shift_msa, self.single_token_modulation[0])
+        scale_msa = self.quick_token_merge(scale_msa, self.single_token_modulation[1])
+        gate_msa = self.quick_token_merge(gate_msa, self.single_token_modulation[2])
+        shift_mlp = self.quick_token_merge(shift_mlp, self.single_token_modulation[3])
+        scale_mlp = self.quick_token_merge(scale_mlp, self.single_token_modulation[4])
+        gate_mlp = self.quick_token_merge(gate_mlp, self.single_token_modulation[5])
+        
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        torch.cuda.empty_cache()
         return x
 
 
@@ -134,9 +158,18 @@ class FinalLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
+        self.single_token_modulation = nn.ModuleList([nn.Linear(32, 1, bias=True) for _ in range(2)])
 
+    def quick_token_merge(self, x, func):
+        x = x.permute(0,2,1)
+        x = func(x)
+        x = x.permute(0,2,1).squeeze(1)
+        return x
+    
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=2)
+        shift = self.quick_token_merge(shift, self.single_token_modulation[0])
+        scale = self.quick_token_merge(scale, self.single_token_modulation[1])
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
@@ -157,6 +190,7 @@ class DiT(nn.Module):
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
+        text_embedding = 2048,
         learn_sigma=True,
     ):
         super().__init__()
@@ -168,7 +202,7 @@ class DiT(nn.Module):
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.y_embedder = LabelEmbedder(text_embedding, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -198,7 +232,8 @@ class DiT(nn.Module):
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.y_embedder.mlp[2].weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -240,7 +275,7 @@ class DiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        c = t.unsqueeze(1) + y                   # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)

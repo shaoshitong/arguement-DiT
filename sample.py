@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from download import find_model
-from models import DiT_models
+from models_old import DiT_models
 import argparse
 
 

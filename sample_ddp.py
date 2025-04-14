@@ -13,7 +13,7 @@ For a simple single-GPU/CPU sampling script, see sample.py.
 """
 import torch
 import torch.distributed as dist
-from models import DiT_models
+from models_old import DiT_models
 from download import find_model
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
@@ -24,13 +24,47 @@ import numpy as np
 import math
 import argparse
 import torch.nn.functional as F
+import random
+import pandas as pd
+import csv
+from pathlib import Path
 
-def setup_fake_ddp():
-    os.environ['RANK'] = '0'
-    os.environ['WORLD_SIZE'] = '1'
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'  # 随便一个没被占用的端口
-    dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo", rank=0, world_size=1)
+def setup_environment():
+    """检查并设置分布式训练环境"""
+    if "RANK" not in os.environ:
+        print("🚨 Warning: RANK is not set, assuming single GPU mode.")
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29638"
+
+    # 仅当需要多 GPU 训练时，初始化分布式环境
+    if int(os.environ["WORLD_SIZE"]) > 1:
+        dist.init_process_group(backend="nccl")
+        os.environ["MASTER_PORT"] = "29638"
+        print(f"✅ Distributed initialized: rank {os.environ['RANK']} / {os.environ['WORLD_SIZE']}")
+    else:
+        print("✅ Running in single GPU mode. Distributed training is disabled.")
+
+# 运行环境设置
+setup_environment()
+
+def get_random_captions_from_indices(y, data_path='/data/shared_data/ILSVRC2012/caption_embeddings'):
+    n = len(y)  # batch_size
+    all_classes = os.listdir(data_path)  # 获取所有class目录
+    embedding_list = []
+
+    for i in range(n):
+        cls_idx = y[i].item()  # 获取当前的类索引
+        cls = all_classes[cls_idx]  # 根据索引选择对应的类
+        caption_file = os.path.join(data_path, cls)
+        embedding = torch.load(caption_file, map_location=torch.device('cpu')).squeeze()  # 去掉多余维度
+        embedding_list.append(embedding)
+
+    return embedding_list
+
+
+
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
@@ -38,9 +72,13 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
     samples = []
     for i in tqdm(range(num), desc="Building .npz file from samples"):
-        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-        sample_np = np.asarray(sample_pil).astype(np.uint8)
-        samples.append(sample_np)
+        try:
+            sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
+            sample_np = np.asarray(sample_pil).astype(np.uint8)
+            samples.append(sample_np)
+        except Exception as e:
+            print(f"Error loading sample {i:06d}.png: {e}")
+            continue
     samples = np.stack(samples)
     assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = f"{sample_dir}.npz"
@@ -48,19 +86,21 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
     return npz_path
 
-
+@torch.no_grad()
 def main(args):
     """
     Run sampling.
     """
-    setup_fake_ddp()
-
     torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
 
+
+
     # Setup DDP:
-    # dist.init_process_group("nccl")
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
@@ -84,6 +124,8 @@ def main(args):
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
     model.eval()  # important!
+    model = model.to(torch.bfloat16)
+    model = torch.compile(model)
     diffusion = create_diffusion(str(args.num_sampling_steps))
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
@@ -114,32 +156,17 @@ def main(args):
     pbar = range(iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
-    total_class_list = [i for i in range(args.num_classes)] * int(args.num_fid_samples//args.num_classes)
-    total_class_list = torch.LongTensor(total_class_list).to(device).int()
-    total_class_list = total_class_list[::dist.get_world_size()]
-    
-    for ii in pbar:
+    for _ in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = F.one_hot(total_class_list[ii*n:(ii+1)*n].long(),num_classes=args.num_classes)
-
-        class_B = torch.randint(0, args.num_classes, (n,), device=device)
-        class_B = F.one_hot(class_B, num_classes=args.num_classes)
-        mix_rate = torch.rand(n, device=device)
-
-        cutmix_y = mix_rate*y + (1-mix_rate)*class_B
-        rand_vals = torch.rand(n, device=device)  # 生成 [0, 1] 范围内的随机数
-
-        y = torch.where(rand_vals.view(-1,1) < args.prob_cutmix, cutmix_y, y)  # 按概率选择标签
-
-
-
-
+        y = torch.randint(0, args.num_classes, (n,)).to(device)
+        # embedding_list = get_random_captions_from_indices(y)
+        # text_embedding = torch.stack(embedding_list, dim=0).to(device).to(torch.float32)
 
         # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
-            y_null = torch.zeros(n,args.num_classes).to(device)
+            y_null = torch.tensor([1000] * n, device=device)
             y = torch.cat([y, y_null], 0)
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
             sample_fn = model.forward_with_cfg
@@ -148,14 +175,24 @@ def main(args):
             sample_fn = model.forward
 
         # Sample images:
-        samples = diffusion.p_sample_loop(
-            sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            samples = diffusion.p_sample_loop(
+                sample_fn, z.shape, z.to(torch.bfloat16), clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
+            )
         if using_cfg:
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
-        samples = vae.decode(samples / 0.18215).sample
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+        if samples.shape[0] > 32:
+            results = []
+            for i in range(samples.shape[0] // 32):
+                samples_batch = samples[i*32:(i+1)*32]
+                samples_batch = vae.decode(samples_batch / 0.18215).sample
+                samples_batch = torch.clamp(127.5 * samples_batch + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+                results.append(samples_batch)
+            samples = np.concatenate(results, axis=0)
+        else:
+            samples = vae.decode(samples / 0.18215).sample
+            samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
@@ -176,22 +213,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-L/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--sample-dir", type=str, default="samples_after")
-    parser.add_argument("--per-proc-batch-size", type=int, default=32)
+    parser.add_argument("--sample-dir", type=str, default="samples_50k_dc_20250412")
+    parser.add_argument("--per-proc-batch-size", type=int, default=256)
     parser.add_argument("--num-fid-samples", type=int, default=10_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale",  type=float, default=1.5)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--prob_cutmix", type=int, default=0.25)
+    parser.add_argument("--prob_cutmix", type=int, default=0.15)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
-    parser.add_argument("--ckpt", type=str, default="/home/shaoshitong/project/argument-DiT/results/019-DiT-L-2/checkpoints/0080000.pt",
+    parser.add_argument("--ckpt", type=str, default="/home/shaoshitong/project/argument-DiT/results/20250408_162056-DiT-L-2-min-50000/checkpoints/0040000.pt",
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
 
     parser.add_argument("--cutmix_noise_threshold_ratio", type=int, default=500)
     parser.add_argument("--do_cutmix_above_threshold_prob", type=float, default=0.5)
 
     args = parser.parse_args()
+    
+    args.sample_dir = args.sample_dir + "_" + args.ckpt.split("/")[-1].split(".")[0]
     main(args)

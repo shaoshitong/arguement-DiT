@@ -153,6 +153,14 @@ def main(args):
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
     for _ in pbar:
+        tag = 1
+        for i in range(n):
+            index = i * dist.get_world_size() + rank + total
+            if not os.path.exists(f"{sample_folder_dir}/{index:06d}.png"):
+                tag = 0
+        if tag == 1:
+            print(f"Skip {rank+total} to {rank+total+n} samples")
+            continue
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,))

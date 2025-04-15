@@ -39,8 +39,12 @@ from diffusers.models import AutoencoderKL
 import torchvision.transforms.functional as Fun
 from torch.utils.data import Dataset
 from torchvision.datasets.folder import default_loader
+from prefetch_generator import BackgroundGenerator
 
 
+class DataLoaderX(DataLoader):
+    def __iter__(self):
+        return BackgroundGenerator(super().__iter__())
 
 
 def setup_environment():
@@ -50,7 +54,7 @@ def setup_environment():
         os.environ["RANK"] = "0"
         os.environ["WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        os.environ["MASTER_PORT"] = "29533"
 
     # 仅当需要多 GPU 训练时，初始化分布式环境
     if int(os.environ["WORLD_SIZE"]) > 1:
@@ -161,11 +165,23 @@ def main(args):
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # Get current timestamp
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{timestamp}-{model_string_name}-{args.select_type}-{args.select_num}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if args.resume_ckpt is not None and os.path.isdir(args.resume_ckpt):
+            experiment_dir = args.resume_ckpt.split("/checkpoints")[0]
+            print(f"Resuming from checkpoint: {experiment_dir}")
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+        else:
+            experiment_dir = f"{args.results_dir}/{timestamp}-{model_string_name}-{args.select_type}-{args.select_num}"  # Create an experiment folder
+            checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+            os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        # 保存配置信息到config.json
+        config_path = os.path.join(checkpoint_dir, "config.json")
+        config_dict = vars(args)  # 将参数对象转换为字典
+        import json
+        with open(config_path, "w") as f:
+            json.dump(config_dict, f, indent=4)
+        logger.info(f"配置信息已保存到 {config_path}")
     else:
         logger = create_logger(None)
 
@@ -176,16 +192,43 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes
     )
-    # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+
+    if args.resume_ckpt is not None:
+        if os.path.isdir(args.resume_ckpt):
+            # Find the checkpoint with the largest step number
+            checkpoint_files = glob(os.path.join(args.resume_ckpt, "*.pt"))
+            if not checkpoint_files:
+                raise ValueError(f"No checkpoint files found in {args.resume_ckpt}")
+            # Extract step numbers and find the largest one
+            steps = [int(os.path.basename(f).split('.')[0]) for f in checkpoint_files]
+            latest_checkpoint = checkpoint_files[steps.index(max(steps))]
+            checkpoint = torch.load(latest_checkpoint, map_location=torch.device('cuda'))
+            model.load_state_dict(checkpoint["model"])
+            ema.load_state_dict(checkpoint["ema"])
+            model = DDP(model.to(device), device_ids=[rank])
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+            opt.load_state_dict(checkpoint["opt"])
+            if rank == 0:
+                logger.info(f"Resumed from checkpoint: {latest_checkpoint}")
+        else:
+            checkpoint = torch.load(args.resume_ckpt, map_location=torch.device('cuda'))
+            latest_checkpoint = args.resume_ckpt
+            model.load_state_dict(checkpoint["model"])
+            ema.load_state_dict(checkpoint["ema"])
+            model = DDP(model.to(device), device_ids=[rank])
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+            opt.load_state_dict(checkpoint["opt"])
+    else:
+        model = DDP(model.to(device), device_ids=[rank])
+        # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+        latest_checkpoint = None
+    # Note that parameter initialization is done within the DiT constructor
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
     transform = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
@@ -200,7 +243,8 @@ def main(args):
     for d in select_info:
         merged_dict.update(d)
     dataset = CustomDataset(args.data_path,image_size=args.image_size,transform=transform,
-                            select_info=merged_dict, select_type=args.select_type, select_num=args.select_num)
+                            select_info=merged_dict, select_type=args.select_type, 
+                            select_num=args.select_num, interval=args.interval)
 
     sampler = DistributedSampler(
         dataset,
@@ -209,26 +253,37 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
-    loader = DataLoader(
+    loader = DataLoaderX(
         dataset,
         batch_size=int(args.global_batch_size // dist.get_world_size()),
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True
     )
 
 
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
+    # 加载每个类的 caption_embedding.npy（每类一个）
+    embedding_dict = {}
+    prompt_root = args.prompt_root
+    # print(self.class_names)
+    for class_name in dataset.class_names:
+        embedding_file = os.path.join(prompt_root, class_name + ".pt")
+        embedding = torch.load(embedding_file, map_location=torch.device('cpu')).cuda()
+        embedding_dict[class_name] = embedding
+
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    if args.resume_ckpt is None:
+        update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    train_steps = 0 if latest_checkpoint is None else int(latest_checkpoint.split("checkpoints/")[1].split(".")[0])
+    print(f"begin train_steps: {train_steps}")
     log_steps = 0
     running_loss = 0
     start_time = time()
@@ -236,10 +291,15 @@ def main(args):
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
+        if args.select_type == "dynamic":
+            loader.dataset.update_dataset(epoch * len(loader.dataset)) # TODO: check
         logger.info(f"Beginning epoch {epoch}...")
-        for x, text in loader:
-        # for x,y in loader:
-            text_embedding = text.squeeze(1)
+        for x, class_idx in loader:
+            text_embedding = []
+            for _i in class_idx:
+                class_name = dataset.image_folder.classes[_i]
+                text_embedding.append(embedding_dict[class_name].squeeze(0))
+            text_embedding = torch.stack(text_embedding, dim=0)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device="cpu")
 
             with torch.no_grad():
@@ -266,6 +326,8 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
+                if rank == 0:
+                    print(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
@@ -296,12 +358,15 @@ def main(args):
 if __name__ == "__main__":
 
 
+
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, default = "/data/shared_data/ILSVRC2012/train")
-    parser.add_argument("--cutmix_data_path", type=str, default = "/share/data/ILSVRC2012/cutmix_train")
-    parser.add_argument("--select_info", type=str, default = "/home/shaoshitong/project/DiT/samples/DiT-XL-2-DiT-XL-2-256x256-size-256-vae-ema-cfg-1.5-seed-0/merged.json")
+    parser.add_argument("--prompt_root", type=str, default="/mnt/weka/st_workspace/DDDM/ILSVRC/ILSVRC2012/caption_embeddings")
+    parser.add_argument("--data_path", type=str, default = "/mnt/weka/st_workspace/DDDM/ILSVRC/ILSVRC2012/train")
+    parser.add_argument("--cutmix_data_path", type=str, default = "/mnt/weka/st_workspace/DDDM/ILSVRC/ILSVRC2012/train")
+    parser.add_argument("--select_info", type=str, default = "./baseline_dataset_list/merged.json")
     parser.add_argument("--select_type", type=str, default = "random")
+    parser.add_argument("--interval", type=int, default = 2)
     parser.add_argument("--select_num", type=int, default = 50000)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-L/2")
@@ -311,8 +376,9 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=128)
     parser.add_argument("--global-seed", type=int, default=43)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--resume-ckpt", type=str, default=None)
     parser.add_argument("--ckpt-every", type=int, default=20_000)
     args = parser.parse_args()
     main(args)

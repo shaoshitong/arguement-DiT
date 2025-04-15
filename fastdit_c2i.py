@@ -13,7 +13,7 @@ import torchvision.utils as vutils
 from pathlib import Path
 import pandas as pd
 import random
-from dataset.dataset_wocutmix import CustomDataset_OLD as CustomDataset
+from dataset.dataset_dc import CustomDataset_OLD as CustomDataset
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

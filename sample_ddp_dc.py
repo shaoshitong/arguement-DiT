@@ -3,72 +3,111 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-import os
-
-# 确保 samples 文件夹存在
-
 
 """
-Sample new images from a pre-trained DiT.
+Samples a large number of images from a pre-trained DiT model using DDP.
+Subsequently saves a .npz file that can be used to compute FID and other
+evaluation metrics via the ADM repo: https://github.com/openai/guided-diffusion/tree/main/evaluations
+
+For a simple single-GPU/CPU sampling script, see sample.py.
 """
 import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-from torchvision.utils import save_image
-from diffusion import create_diffusion
-from diffusion.gaussian_diffusion import _extract_into_tensor
-from diffusers.models import AutoencoderKL
+import torch.distributed as dist
+from models import DiT_models
 from download import find_model
-from models_old import DiT_models
-import argparse
+from diffusion import create_diffusion
+from diffusers.models import AutoencoderKL
+from tqdm import tqdm
+import os
 from PIL import Image
 import numpy as np
-from torchvision.datasets.folder import default_loader
-from dataset.generate_argument import prepare_images
+import math
+import argparse
+import torch.nn.functional as F
+import random
+import pandas as pd
+import csv
+from pathlib import Path
 
-from torchvision import transforms
-def center_crop_arr(pil_image, image_size):
+def setup_environment():
+    """检查并设置分布式训练环境"""
+    if "RANK" not in os.environ:
+        print("🚨 Warning: RANK is not set, assuming single GPU mode.")
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29638"
+
+    # 仅当需要多 GPU 训练时，初始化分布式环境
+    if int(os.environ["WORLD_SIZE"]) > 1:
+        dist.init_process_group(backend="nccl")
+        os.environ["MASTER_PORT"] = "29638"
+        print(f"✅ Distributed initialized: rank {os.environ['RANK']} / {os.environ['WORLD_SIZE']}")
+    else:
+        print("✅ Running in single GPU mode. Distributed training is disabled.")
+
+# 运行环境设置
+setup_environment()
+
+def get_random_captions_from_indices(y, data_path='/data/shared_data/ILSVRC2012/caption_embeddings'):
+    n = len(y)  # batch_size
+    all_classes = os.listdir(data_path)  # 获取所有class目录
+    embedding_list = []
+
+    for i in range(n):
+        cls_idx = y[i].item()  # 获取当前的类索引
+        cls = all_classes[cls_idx]  # 根据索引选择对应的类
+        caption_file = os.path.join(data_path, cls)
+        embedding = torch.load(caption_file, map_location=torch.device('cpu')).squeeze()  # 去掉多余维度
+        embedding_list.append(embedding)
+
+    return embedding_list
+
+
+
+
+def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
+    Builds a single .npz file from a folder of .png samples.
     """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
+    samples = []
+    for i in tqdm(range(num), desc="Building .npz file from samples"):
+        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
+        sample_np = np.asarray(sample_pil).astype(np.uint8)
+        samples.append(sample_np)
+    samples = np.stack(samples)
+    assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
+    npz_path = f"{sample_dir}.npz"
+    np.savez(npz_path, arr_0=samples)
+    print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
+    return npz_path
 
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
-
-def get_image(img_path,transform):
-    lodder = default_loader
-    if img_path:
-        img = lodder(img_path)
-        image = transform(img).unsqueeze(0)
-    return image
-
-
-
-
-
+@torch.no_grad()
 def main(args):
-    # Setup PyTorch:
-    torch.manual_seed(args.seed)
+    """
+    Run sampling.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
+    assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+    # Setup DDP:
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+    seed = args.global_seed * dist.get_world_size() + rank
+    torch.manual_seed(seed)
+    torch.cuda.set_device(device)
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
     if args.ckpt is None:
         assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
         assert args.image_size in [256, 512]
         assert args.num_classes == 1000
-
 
     # Load model:
     latent_size = args.image_size // 8
@@ -81,68 +120,121 @@ def main(args):
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
     model.eval()  # important!
+    model = model.to(torch.bfloat16)
+    model = torch.compile(model)
     diffusion = create_diffusion(str(args.num_sampling_steps))
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    image_path = "/home/shaoshitong/project/argument-DiT/images/n01614925/images/n01614925_13.JPEG"
-    mix_image_path = "/data/shared_data/ILSVRC2012/train/n03598930/images/n03598930_7342.JPEG"
-    # Labels to condition the model with (feel free to change):
-    class_labels = [22]
-    prepare_img = prepare_images(Image.open(image_path).convert("RGB"), Image.open(mix_image_path).convert("RGB"), 256, "cutmix")[0]
-    prepare_img = prepare_img * 2 - 1
-    mix_img = torch.clamp(127.5 * prepare_img + 128.0, 0, 255).to("cpu", dtype=torch.uint8).permute(0, 2, 3, 1).numpy()[0]
-    print(mix_img.shape)
-    Image.fromarray(mix_img).save("mix_img.png")
-    x = vae.encode(prepare_img.to(device)).latent_dist.sample().mul_(0.18215)
-    save_t = 50
-    # begin refine
-    t = torch.tensor([0] * x.shape[0], device=device)
-    n = len(class_labels)
-    y_null = torch.tensor([1000] * n, device=device)
-    model_output = model.forward(x, t, y_null)
-    model_output, model_var_values = torch.split(model_output, 4, dim=1)
-    # min_log = _extract_into_tensor(diffusion.posterior_log_variance_clipped, t, x.shape)
-    # max_log = _extract_into_tensor(np.log(diffusion.betas), t, x.shape)
-    # # The model_var_values is [-1, 1] for [min_var, max_var].
-    # frac = (model_var_values + 1) / 2
-    # model_log_variance = frac * max_log + (1 - frac) * min_log
-    # model_variance = torch.exp(model_log_variance)
-    x_t = diffusion.q_sample(x,torch.tensor([save_t]*x.shape[0], device=device),noise=model_output)
-    z = x_t
-    y = torch.tensor(class_labels, device=device)
+    assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
+    using_cfg = args.cfg_scale > 1.0
 
-    # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * n, device=device)
-    y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+    # Create folder to save samples:
+    model_string_name = args.model.replace("/", "-")
+    ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
+    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-vae-{args.vae}-" \
+                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
+    sample_folder_dir = f"{args.sample_dir}/{folder_name}"
+    if rank == 0:
+        os.makedirs(sample_folder_dir, exist_ok=True)
+        print(f"Saving .png samples at {sample_folder_dir}")
+    dist.barrier()
 
-    # Sample images:
-    samples = diffusion.p_sample_loop_with_t(
-        model.forward_with_cfg, z.shape, z,
-        clip_denoised=False, model_kwargs=model_kwargs, progress=True,
-        device=device, begin_t=save_t
-    )
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
-    samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-    os.makedirs("samples_refine", exist_ok=True)
+    # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
+    n = args.per_proc_batch_size
+    global_batch_size = n * dist.get_world_size()
+    # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
+    total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
+    if rank == 0:
+        print(f"Total number of images that will be sampled: {total_samples}")
+    assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
+    samples_needed_this_gpu = int(total_samples // dist.get_world_size())
+    assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
+    iterations = int(samples_needed_this_gpu // n)
+    pbar = range(iterations)
+    pbar = tqdm(pbar) if rank == 0 else pbar
+    total = 0
+    for _ in pbar:
+        tag = 1
+        for i in range(n):
+            index = i * dist.get_world_size() + rank + total
+            if not os.path.exists(f"{sample_folder_dir}/{index:06d}.png"):
+                tag = 0
+        if tag == 1:
+            print(f"Skip {rank+total} to {rank+total+n} samples")
+            continue
+        # Sample inputs:
+        z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
+        y = torch.randint(0, args.num_classes, (n,))
+        embedding_list = get_random_captions_from_indices(y)
+        text_embedding = torch.stack(embedding_list, dim=0).to(device).to(torch.float32)
 
-    # Save samples to disk as   individual .png files
-    for i, sample in enumerate(samples):
-        image_filename = os.path.join("samples_refine", f"{int(save_t):06d}.png")
-        Image.fromarray(sample).save(image_filename)
-        print(f"Saved image: {image_filename}")
+        # Setup classifier-free guidance:
+        if using_cfg:
+            z = torch.cat([z, z], 0)
+            y_null = torch.zeros_like(text_embedding).to(device)
+            y = torch.cat([text_embedding, y_null], 0)
+            model_kwargs = dict(y=y.to(torch.bfloat16), cfg_scale=args.cfg_scale)
+            sample_fn = model.forward_with_cfg
+        else:
+            model_kwargs = dict(y=text_embedding.to(torch.bfloat16))
+            sample_fn = model.forward
+
+        # Sample images:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            samples = diffusion.p_sample_loop(
+                sample_fn, z.shape, z.to(torch.bfloat16), clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
+            )
+        if using_cfg:
+            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+
+        if samples.shape[0] > 32:
+            results = []
+            for i in range(samples.shape[0] // 32):
+                samples_batch = samples[i*32:(i+1)*32]
+                samples_batch = vae.decode(samples_batch / 0.18215).sample
+                samples_batch = torch.clamp(127.5 * samples_batch + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+                results.append(samples_batch)
+            samples = np.concatenate(results, axis=0)
+        else:
+            samples = vae.decode(samples / 0.18215).sample
+            samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+
+        # Save samples to disk as individual .png files
+        for i, sample in enumerate(samples):
+            index = i * dist.get_world_size() + rank + total
+            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+        total += global_batch_size
+
+    # Make sure all processes have finished saving their samples before attempting to convert to .npz
+    dist.barrier()
+    if rank == 0:
+        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        print("Done.")
+    dist.barrier()
+    dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
+    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-L/2")
+    parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
+    parser.add_argument("--sample-dir", type=str, default="samples_50k_dc_20250412")
+    parser.add_argument("--per-proc-batch-size", type=int, default=256)
+    parser.add_argument("--num-fid-samples", type=int, default=10_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--cfg-scale", type=float, default=1.5)
+    parser.add_argument("--cfg-scale",  type=float, default=1.5)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--ckpt", type=str, default="/home/shaoshitong/project/argument-DiT/DiT-XL-2-256x256.pt",
+    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--prob_cutmix", type=int, default=0.15)
+    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
+                        help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
+    parser.add_argument("--ckpt", type=str, default="/home/shaoshitong/project/argument-DiT/results/20250408_162056-DiT-L-2-min-50000/checkpoints/0040000.pt",
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+
+    parser.add_argument("--cutmix_noise_threshold_ratio", type=int, default=500)
+    parser.add_argument("--do_cutmix_above_threshold_prob", type=float, default=0.5)
+
     args = parser.parse_args()
+    
+    args.sample_dir = args.sample_dir + "_" + args.ckpt.split("/")[-1].split(".")[0]
     main(args)

@@ -114,11 +114,11 @@ class CustomDataset(Dataset):
         assert self.select_type == "dynamic", "update_dataset is only used for dynamic selection"
         if iteration > total_iteration:
             iteration = total_iteration
-            tag = 1
+            tag = int(random.random() > 0.5)
         else:
             import random
-            tag = int(random.random() > 0.5)
-        
+            tag = 1
+            
         ratio = float(iteration/total_iteration)
         middle_point = len(self.select_info) * (1/2)
         start_point = 0

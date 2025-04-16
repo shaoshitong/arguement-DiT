@@ -5,6 +5,7 @@ import torch
 import os
 import json
 from tqdm import tqdm
+import random
 
 def flatten(nest_list:list):
     return [j for i in nest_list for j in flatten(i)] if isinstance(nest_list, list) else [nest_list]
@@ -133,9 +134,9 @@ class CustomDataset(Dataset):
                 _cls = self.dict_path2class[_select_info[0]]
                 final_dataset.append((_select_info[0], _cls))
         else:
-            for _select_info in np.random.choice(self.select_info, size=self.select_num, replace=False):
-                _cls = self.dict_path2class[_select_info[0]]
-                final_dataset.append((_select_info[0], _cls))
+            for _zz in np.random.choice(list(range(len(self.select_info))), size=self.select_num, replace=False):
+                _cls = self.dict_path2class[self.select_info[_zz][0]]
+                final_dataset.append((self.select_info[_zz][0], _cls))
         self.image_folder.samples = final_dataset
         print("Mean value", mean_value / len(self.image_folder.samples))
 

@@ -292,7 +292,7 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         if args.select_type == "dynamic":
-            loader.dataset.update_dataset(epoch * len(loader.dataset)) # TODO: check
+            loader.dataset.update_dataset(epoch * len(loader.dataset) / args.global_batch_size) # TODO: check
         logger.info(f"Beginning epoch {epoch}...")
         for x, class_idx in loader:
             text_embedding = []

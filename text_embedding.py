@@ -25,7 +25,7 @@ class TextEmbeddingProcessor:
             captions,  # 传入所有的 captions
             padding="max_length",  # 自动填充到最大长度
             truncation=True,  # 如果超过最大长度则截断
-            max_length=32,  # 设置最大长度
+            max_length=16,  # 设置最大长度
             return_tensors="pt",  # 返回 pytorch 的 tensor 格式
             return_attention_mask=True  # 同时返回 attention_mask
         ).to(self.t5_model.device)
@@ -36,17 +36,17 @@ class TextEmbeddingProcessor:
             outputs = self.t5_model(**inputs)
             embeddings = outputs.last_hidden_state.detach().cpu().to(torch.bfloat16)
 
-        return embeddings  # 返回 embeddings 和 attention_mask
+        return embeddings, inputs["attention_mask"]  # 返回 embeddings 和 attention_mask
 
 
     def process_text_embeddings(self, captions):
         """处理文本嵌入"""
 
         # Compute embeddings and attention mask
-        embeddings = self.compute_t5_embeddings(captions)
+        embeddings, attention_mask = self.compute_t5_embeddings(captions)
 
         # 在这里可以将 embeddings 和 attention_mask 传递给 MLP 或其他网络
-        return embeddings
+        return embeddings, attention_mask
 
 def load_json_data(json_path):
     """加载JSON文件并提取filename和wnid"""
@@ -76,17 +76,38 @@ if __name__ == "__main__":
     # Initialize the processor and run
     
     processor = TextEmbeddingProcessor()
-    json_path = "/home/shaoshitong/project/argument-DiT/captions/imagenet-captions/caption.txt"
+    json_path = "/mnt/weka/st_workspace/DDDM/arguement-DiT/captions/imagenet-captions/caption.txt"
     extracted_data = load_text_data(json_path)
-    root_path = "/data/shared_data/ILSVRC2012/caption_embeddings"
+    root_path = "/mnt/weka/st_workspace/DDDM/ILSVRC/ILSVRC2012/caption_embeddings_tmp"
     if not os.path.exists(root_path):
         os.makedirs(root_path)
     def prompt_template(class_name):
-        return f"a photo of {class_name}."
+        return f"{class_name}"
     
+    max_length = 0
+    
+    token_number_list = []
     for filename, class_name in extracted_data:
         prompt = prompt_template(class_name)
-        embeddings = processor.process_text_embeddings(prompt)
+        embeddings, attention_mask = processor.process_text_embeddings(prompt)
         torch.save(embeddings, os.path.join(root_path, filename + ".pt"))
+        torch.save(attention_mask, os.path.join(root_path, filename + "_mask.pt"))
         print(f"save {filename} to {root_path}")
-        
+        max_length = max(max_length, attention_mask.sum().item())
+    print(max_length)
+
+    # Add histogram plotting code
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 6))
+    plt.hist(token_number_list, bins=30, edgecolor='black')
+    plt.title('Distribution of Token Numbers')
+    plt.xlabel('Number of Tokens')
+    plt.ylabel('Frequency')
+    plt.grid(True, alpha=0.3)
+    plt.savefig('token_distribution.png')
+    plt.close()
+
+    print(f"Total samples: {len(token_number_list)}")
+    print(f"Mean token count: {sum(token_number_list)/len(token_number_list):.2f}")
+    print(f"Max token count: {max(token_number_list)}")
+    print(f"Min token count: {min(token_number_list)}")

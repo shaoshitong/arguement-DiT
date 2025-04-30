@@ -844,7 +844,11 @@ class GaussianDiffusion:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t, t, **model_kwargs)
-
+            if isinstance(model_output, tuple) or isinstance(model_output, list):
+                model_output, proj_loss = model_output
+            else:
+                proj_loss = 0.0
+            terms["proj_loss"] = proj_loss
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
@@ -877,9 +881,9 @@ class GaussianDiffusion:
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
+                terms["loss"] = terms["mse"].mean() + terms["vb"].mean() + proj_loss * 0.5
             else:
-                terms["loss"] = terms["mse"]
+                terms["loss"] = terms["mse"] + proj_loss * 0.5
         else:
             raise NotImplementedError(self.loss_type)
 

@@ -13,9 +13,10 @@ For a simple single-GPU/CPU sampling script, see sample.py.
 """
 import torch
 import torch.distributed as dist
-from models_old import DiT_models
+from sit import SiT_models
 from download import find_model
 from diffusion import create_diffusion
+from diffusion.samplers import euler_maruyama_sampler, euler_sampler
 from diffusers.models import AutoencoderKL
 from tqdm import tqdm
 import os
@@ -49,20 +50,23 @@ def setup_environment():
 # 运行环境设置
 setup_environment()
 
-def get_random_captions_from_indices(y, data_path='/data/shared_data/ILSVRC2012/caption_embeddings'):
+def get_random_captions_from_indices(y, 
+                                     data_path= "/mnt/weka/st_workspace/DDDM/ILSVRC/ILSVRC2012/caption_embeddings_tmp",
+                                     class_index=None):
     n = len(y)  # batch_size
-    all_classes = os.listdir(data_path)  # 获取所有class目录
     embedding_list = []
-
+    embedding_mask_list = []
     for i in range(n):
         cls_idx = y[i].item()  # 获取当前的类索引
-        cls = all_classes[cls_idx]  # 根据索引选择对应的类
-        caption_file = os.path.join(data_path, cls)
+        cls = class_index[cls_idx]  # 根据索引选择对应的类
+        caption_file = os.path.join(data_path, cls + '.pt')
+        embedding_mask_file = os.path.join(data_path, cls + '_mask.pt')
         embedding = torch.load(caption_file, map_location=torch.device('cpu')).squeeze()  # 去掉多余维度
+        embedding_mask = torch.load(embedding_mask_file, map_location=torch.device('cpu')).squeeze()
         embedding_list.append(embedding)
-
-    return embedding_list
-
+        embedding_mask_list.append(embedding_mask)
+        
+    return embedding_list, embedding_mask_list
 
 
 
@@ -72,13 +76,9 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
     samples = []
     for i in tqdm(range(num), desc="Building .npz file from samples"):
-        try:
-            sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-            sample_np = np.asarray(sample_pil).astype(np.uint8)
-            samples.append(sample_np)
-        except Exception as e:
-            print(f"Error loading sample {i:06d}.png: {e}")
-            continue
+        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
+        sample_np = np.asarray(sample_pil).astype(np.uint8)
+        samples.append(sample_np)
     samples = np.stack(samples)
     assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = f"{sample_dir}.npz"
@@ -95,7 +95,14 @@ def main(args):
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
 
-
+    # 读取caption.txt获取类别ID映射
+    class_ids = []
+    with open("/mnt/weka/st_workspace/DDDM/arguement-DiT/captions/imagenet-captions/caption.txt", 'r') as f:
+        for line in f:
+            # 提取每行的第一个词作为类别ID
+            class_id = line.strip().split()[0]
+            class_ids.append(class_id)
+    
 
     # Setup DDP:
     if not dist.is_initialized():
@@ -115,18 +122,27 @@ def main(args):
 
     # Load model:
     latent_size = args.image_size // 8
-    model = DiT_models[args.model](
+    block_kwargs = {"fused_attn": True, "qk_norm": False}
+    model = SiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        in_channels=4,
+        num_classes=1000,
+        class_dropout_prob=0.1,
+        z_dims=[768],
+        encoder_depth=8,
+        bn_momentum=0.1,
+        **block_kwargs
     ).to(device)
     # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
-    ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
+    ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
+    
+    # latents_scale = model.state_dict()["bn.running_var"].clone().rsqrt().view(1, 4, 1, 1).to(device)
+    # latents_bias = model.state_dict()["bn.running_mean"].clone().view(1, 4, 1, 1).to(device)
     model.eval()  # important!
-    model = model.to(torch.bfloat16)
+    model = model
     model = torch.compile(model)
-    diffusion = create_diffusion(str(args.num_sampling_steps))
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale > 1.0
@@ -153,52 +169,60 @@ def main(args):
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
-    pbar = range(iterations)
+    pbar = range(0, iterations, 1)
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
     for _ in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,)).to(device)
-        # embedding_list = get_random_captions_from_indices(y)
-        # text_embedding = torch.stack(embedding_list, dim=0).to(device).to(torch.float32)
+        ccls = y = torch.randint(0, args.num_classes, (n,))
+        embedding_list, embedding_mask_list = get_random_captions_from_indices(y, class_index=class_ids)
+        text_embedding = torch.stack(embedding_list, dim=0).to(device).to(torch.float32)
+        text_embedding_mask = torch.stack(embedding_mask_list, dim=0).to(device).bool()
 
-        # Setup classifier-free guidance:
-        if using_cfg:
-            z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
-            y = torch.cat([y, y_null], 0)
-            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-            sample_fn = model.forward_with_cfg
-        else:
-            model_kwargs = dict(y=y)
-            sample_fn = model.forward
+        assert not args.heun or args.mode == "ode", "Heun's method is only available for ODE sampling."
 
         # Sample images:
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            samples = diffusion.p_sample_loop(
-                sample_fn, z.shape, z.to(torch.bfloat16), clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
-            )
-        if using_cfg:
-            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        sampling_kwargs = dict(
+            model=model, 
+            latents=z,
+            y=ccls.to(device),
+            num_steps=args.num_steps, 
+            heun=args.heun,
+            cfg_scale=args.cfg_scale,
+            guidance_low=args.guidance_low,
+            guidance_high=args.guidance_high,
+            path_type=args.path_type,
+            text_embedding=text_embedding,
+            text_embedding_mask=text_embedding_mask
+        )
+        
+        with torch.no_grad():
+            if args.mode == "sde":
+                samples = euler_maruyama_sampler(**sampling_kwargs).to(torch.float32)
+            elif args.mode == "ode":
+                samples = euler_sampler(**sampling_kwargs).to(torch.float32)
+            else:
+                raise NotImplementedError()
+            # samples = (samples / latents_scale + latents_bias)
+            # print(samples.mean(), samples.min(), samples.max(), samples.view(-1).std(dim=0), "test")
+            if samples.shape[0] > 32:
+                results = []
+                for i in range(samples.shape[0] // 32):
+                    samples_batch = samples[i*32:(i+1)*32]
+                    samples_batch = vae.decode(samples_batch / 0.18215).sample
+                    samples_batch = torch.clamp(127.5 * samples_batch + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+                    results.append(samples_batch)
+                samples = np.concatenate(results, axis=0)
+            else:
+                samples = vae.decode(samples / 0.18215).sample
+                samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
-        if samples.shape[0] > 32:
-            results = []
-            for i in range(samples.shape[0] // 32):
-                samples_batch = samples[i*32:(i+1)*32]
-                samples_batch = vae.decode(samples_batch / 0.18215).sample
-                samples_batch = torch.clamp(127.5 * samples_batch + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-                results.append(samples_batch)
-            samples = np.concatenate(results, axis=0)
-        else:
-            samples = vae.decode(samples / 0.18215).sample
-            samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-
-        # Save samples to disk as individual .png files
-        for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
-        total += global_batch_size
+            # Save samples to disk as individual .png files
+            for i, sample in enumerate(samples):
+                index = i * dist.get_world_size() + rank + total
+                Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+            total += global_batch_size
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
@@ -211,24 +235,27 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-L/2")
+    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--sample-dir", type=str, default="samples_10k_random")
+    parser.add_argument("--sample-dir", type=str, default="samples_10k_dc_20250426")
     parser.add_argument("--per-proc-batch-size", type=int, default=1250)
-    parser.add_argument("--num-fid-samples", type=int, default=10_000)
+    parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--cfg-scale",  type=float, default=1.5)
+    parser.add_argument("--cfg-scale",  type=float, default=1.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--global-seed", type=int, default=1)
     parser.add_argument("--prob_cutmix", type=int, default=0.15)
-    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--tf32", default=True, action="store_true",
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
     parser.add_argument("--ckpt", type=str, default="/home/shaoshitong/project/argument-DiT/results/20250408_162056-DiT-L-2-min-50000/checkpoints/0040000.pt",
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
-
-    parser.add_argument("--cutmix_noise_threshold_ratio", type=int, default=500)
-    parser.add_argument("--do_cutmix_above_threshold_prob", type=float, default=0.5)
+    parser.add_argument("--num-steps", type=int, default=250)
+    parser.add_argument("--heun", default=False, action="store_true")
+    parser.add_argument("--guidance-low", type=float, default=0.0)
+    parser.add_argument("--guidance-high", type=float, default=1.0)
+    parser.add_argument("--path-type", type=str, default="linear")
+    parser.add_argument("--mode", type=str, default="ode")
 
     args = parser.parse_args()
     

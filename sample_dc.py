@@ -13,7 +13,7 @@ For a simple single-GPU/CPU sampling script, see sample.py.
 """
 import torch
 import torch.distributed as dist
-from models_old import DiT_models
+from models_v3 import DiT_models
 from download import find_model
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
@@ -49,20 +49,23 @@ def setup_environment():
 # 运行环境设置
 setup_environment()
 
-def get_random_captions_from_indices(y, data_path='/data/shared_data/ILSVRC2012/caption_embeddings'):
+def get_random_captions_from_indices(y, 
+                                     data_path= "/mnt/weka/st_workspace/DDDM/ILSVRC/ILSVRC2012/caption_embeddings_tmp",
+                                     class_index=None):
     n = len(y)  # batch_size
-    all_classes = os.listdir(data_path)  # 获取所有class目录
     embedding_list = []
-
+    embedding_mask_list = []
     for i in range(n):
         cls_idx = y[i].item()  # 获取当前的类索引
-        cls = all_classes[cls_idx]  # 根据索引选择对应的类
-        caption_file = os.path.join(data_path, cls)
+        cls = class_index[cls_idx]  # 根据索引选择对应的类
+        caption_file = os.path.join(data_path, cls + '.pt')
+        embedding_mask_file = os.path.join(data_path, cls + '_mask.pt')
         embedding = torch.load(caption_file, map_location=torch.device('cpu')).squeeze()  # 去掉多余维度
+        embedding_mask = torch.load(embedding_mask_file, map_location=torch.device('cpu')).squeeze()
         embedding_list.append(embedding)
-
-    return embedding_list
-
+        embedding_mask_list.append(embedding_mask)
+        
+    return embedding_list, embedding_mask_list
 
 
 
@@ -72,13 +75,9 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
     samples = []
     for i in tqdm(range(num), desc="Building .npz file from samples"):
-        try:
-            sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-            sample_np = np.asarray(sample_pil).astype(np.uint8)
-            samples.append(sample_np)
-        except Exception as e:
-            print(f"Error loading sample {i:06d}.png: {e}")
-            continue
+        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
+        sample_np = np.asarray(sample_pil).astype(np.uint8)
+        samples.append(sample_np)
     samples = np.stack(samples)
     assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
     npz_path = f"{sample_dir}.npz"
@@ -95,7 +94,14 @@ def main(args):
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
 
-
+    # 读取caption.txt获取类别ID映射
+    class_ids = []
+    with open("/mnt/weka/st_workspace/DDDM/arguement-DiT/captions/imagenet-captions/caption.txt", 'r') as f:
+        for line in f:
+            # 提取每行的第一个词作为类别ID
+            class_id = line.strip().split()[0]
+            class_ids.append(class_id)
+    
 
     # Setup DDP:
     if not dist.is_initialized():
@@ -153,25 +159,31 @@ def main(args):
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
-    pbar = range(iterations)
+    pbar = range(0, iterations, 1)
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
     for _ in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,)).to(device)
-        # embedding_list = get_random_captions_from_indices(y)
-        # text_embedding = torch.stack(embedding_list, dim=0).to(device).to(torch.float32)
+        ccls = y = torch.randint(0, args.num_classes, (n,))
+        embedding_list, embedding_mask_list = get_random_captions_from_indices(y, class_index=class_ids)
+        text_embedding = torch.stack(embedding_list, dim=0).to(device).to(torch.float32)
+        text_embedding_mask = torch.stack(embedding_mask_list, dim=0).to(device).bool()
 
         # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
-            y = torch.cat([y, y_null], 0)
-            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+            y_null = torch.zeros_like(text_embedding).to(device)
+            ccls = ccls.to(device)
+            y = torch.cat([text_embedding, y_null], 0)
+            text_embedding_mask = torch.cat([text_embedding_mask, torch.zeros_like(text_embedding_mask).bool()], 0)
+            ccls_null = torch.tensor([1000] * n, device=device)
+            ccls = torch.cat([ccls, ccls_null], 0)
+            print(ccls.shape, text_embedding_mask.shape, y.shape)
+            model_kwargs = dict(y=y.to(torch.bfloat16), ccls=ccls, attn_mask=text_embedding_mask, cfg_scale=args.cfg_scale)
             sample_fn = model.forward_with_cfg
         else:
-            model_kwargs = dict(y=y)
+            model_kwargs = dict(y=text_embedding.to(torch.bfloat16), ccls=ccls, attn_mask=text_embedding_mask)
             sample_fn = model.forward
 
         # Sample images:
@@ -213,14 +225,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-L/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--sample-dir", type=str, default="samples_10k_random")
+    parser.add_argument("--sample-dir", type=str, default="samples_10k_dc_20250421")
     parser.add_argument("--per-proc-batch-size", type=int, default=1250)
     parser.add_argument("--num-fid-samples", type=int, default=10_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale",  type=float, default=1.5)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--global-seed", type=int, default=1)
     parser.add_argument("--prob_cutmix", type=int, default=0.15)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
